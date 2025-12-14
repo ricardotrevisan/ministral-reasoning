@@ -1,0 +1,6 @@
+# --- Serper API ---
+SEARCH_TIMEOUT=20
+SEARCH_MAX_RESULTS=3
+SEARCH_MAX_CHARS=3000
+SERPER_API_KEY=<your key>
+SERPER_BASE_URL=https://google.serper.dev
