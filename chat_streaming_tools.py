@@ -39,7 +39,10 @@ TOOLS: List[Dict[str, Any]] = [
 ]
 
 
-def call_model(messages: List[Dict[str, Any]], tools: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+def call_model(
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]] | None = None,
+) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "model": MODEL_NAME,
         "messages": messages,
@@ -56,56 +59,16 @@ def call_model(messages: List[Dict[str, Any]], tools: List[Dict[str, Any]] | Non
     return data["choices"][0]
 
 
-def stream_final_response(
-    messages: List[Dict[str, Any]],
-) -> Dict[str, Any]:
+def handle_tool_calls(message: Dict[str, Any]) -> str:
     """
-    Segunda chamada: mesma API, mas com stream=True para receber
-    a resposta final do assistente token a token.
+    Executa todas as tool_calls solicitadas pelo modelo e
+    retorna um texto resumindo os resultados para o LLM.
+    Não adiciona mensagens com role=tool ao histórico, pois
+    o servidor não lida bem com esse role.
     """
-    payload: Dict[str, Any] = {
-        "model": MODEL_NAME,
-        "messages": messages,
-        "temperature": 0.2,
-        "stream": True,
-    }
-
-    # Nesta fase não queremos novas tool_calls, só a resposta final.
-    with requests.post(URL, headers=HEADERS, json=payload, stream=True) as r:
-        full_content = ""
-        for raw_line in r.iter_lines():
-            if not raw_line:
-                continue
-
-            line = raw_line.decode("utf-8").strip()
-            if not line.startswith("data:"):
-                continue
-
-            content = line[len("data:") :].strip()
-            if content == "[DONE]":
-                break
-
-            try:
-                data = json.loads(content)
-            except json.JSONDecodeError:
-                continue
-
-            delta = data["choices"][0]["delta"]
-            token = delta.get("content") or ""
-            if token:
-                print(token, end="", flush=True)
-                full_content += token
-
-    print()  # quebra de linha após o streaming
-    return {"role": "assistant", "content": full_content}
-
-
-def handle_tool_calls(
-    message: Dict[str, Any],
-    messages: List[Dict[str, Any]],
-) -> None:
-    """Executa todas as tool_calls solicitadas pelo modelo."""
     tool_calls = message.get("tool_calls") or []
+
+    results_for_llm: List[str] = []
 
     for tool_call in tool_calls:
         func_name = tool_call["function"]["name"]
@@ -117,20 +80,17 @@ def handle_tool_calls(
         except json.JSONDecodeError:
             arguments = {}
 
+        print(f"[tool_call] {func_name} args={arguments}")
+
         if func is None:
             result = f"Ferramenta desconhecida: {func_name}"
         else:
-            # Aqui as ferramentas recebem argumentos já parseados (dict).
             result = func(arguments)
 
-        messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": tool_call.get("id", ""),
-                "name": func_name,
-                "content": str(result),
-            }
-        )
+        print(f"[tool_result] {func_name} -> {result}")
+        results_for_llm.append(f"{func_name}: {result}")
+
+    return "\n".join(results_for_llm)
 
 
 def chat_with_tools() -> None:
@@ -147,7 +107,13 @@ def chat_with_tools() -> None:
             print("🔴 Chat encerrado.")
             break
 
-        messages.append({"role": "user", "content": user_input})
+        # adiciona a pergunta do usuário ao histórico
+        messages.append(
+            {
+                "role": "user",
+                "content": user_input,
+            }
+        )
 
         # 1ª chamada: modelo decide se usa tool
         choice = call_model(messages, tools=TOOLS)
@@ -155,26 +121,27 @@ def chat_with_tools() -> None:
 
         # Se o modelo pediu ferramentas, executa e faz 2ª chamada
         if message.get("tool_calls"):
-            messages.append(message)
-            handle_tool_calls(message, messages)
+            tools_summary = handle_tool_calls(message)
 
-            # 2ª chamada: agora com as respostas das tools (streaming)
-            print("Assistente: ", end="", flush=True)
-            message = stream_final_response(messages)
-        else:
-            # Sem tools: resposta direta (não-streaming)
-            choice = call_model(messages, tools=TOOLS)
+            # Passa os resultados das tools como texto em nova mensagem de usuário
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Resultados das ferramentas:\n"
+                        f"{tools_summary}\n\n"
+                        "Com base nesses resultados, responda à pergunta original do usuário."
+                    ),
+                }
+            )
+
+            choice = call_model(messages)  # 2ª chamada, sem tools, sem streaming
             message = choice["message"]
-            assistant_content = message.get("content", "").strip()
-            if assistant_content:
-                print(f"Assistente: {assistant_content}")
-                messages.append({"role": "assistant", "content": assistant_content})
-            continue
 
-        # Exibe e salva a mensagem já construída no fluxo de streaming
-        assistant_content = message.get("content", "").strip()
+        assistant_content = (message.get("content") or "").strip()
         if assistant_content:
             messages.append({"role": "assistant", "content": assistant_content})
+            print(f"Assistente: {assistant_content}")
 
 
 if __name__ == "__main__":
